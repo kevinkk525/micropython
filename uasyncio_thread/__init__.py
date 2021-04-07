@@ -1,4 +1,4 @@
-# MicroPython uasyncio module
+# MicroPython uasyncio_thread module
 # MIT license; Copyright (c) 2019 Damien P. George
 
 from .core import *

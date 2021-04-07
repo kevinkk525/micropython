@@ -1,14 +1,26 @@
-# MicroPython uasyncio module
+# MicroPython uasyncio_thread module
 # MIT license; Copyright (c) 2019 Damien P. George
 
 from time import ticks_ms as ticks, ticks_diff, ticks_add
 import sys, select
+import _thread
 
 # Import TaskQueue and Task, preferring built-in C code over Python code
 try:
     from _uasyncio import TaskQueue, Task
 except:
     from .task import TaskQueue, Task
+
+# Import ThreadSafeFlag
+from .event import ThreadSafeFlag
+
+################################################################################
+# Thread-specific variables
+
+_thread_ident = None
+_task_cache = []  # cache for arguments needed to create a task from a different thread.
+_task_cache_event = ThreadSafeFlag()
+_thread_lock = _thread.allocate_lock()
 
 
 ################################################################################
@@ -139,6 +151,8 @@ def _promote_to_task(aw):
 
 # Create and schedule a new task from a coroutine
 def create_task(coro):
+    if _thread_ident != _thread.get_ident():
+        raise RuntimeError("Can't create a task from a different thread")
     if not hasattr(coro, "send"):
         raise TypeError("coroutine expected")
     t = Task(coro, globals())
@@ -146,11 +160,27 @@ def create_task(coro):
     return t
 
 
+def run_coroutine_threadsafe(coro, loop):
+    if hasattr(loop, "_run_coroutine_threadsafe"):
+        return loop._run_coroutine_threadsafe(coro)
+    # Returns a Task and not a Future as in CPython. Don't await the Task in a different thread.
+    raise RuntimeError("loop/uasyncio instance on this thread doesn't support threads")
+
+
+async def _await_new_thread_tasks():
+    while True:
+        await _task_cache_event.wait()
+        with _thread_lock:
+            while _task_cache:
+                _task_queue.push_head(_task_cache.pop(0))
+
+
 # Keep scheduling tasks until there are none left to schedule
 def run_until_complete(main_task=None):
     global cur_task
     excs_all = (CancelledError, Exception)  # To prevent heap allocation in loop
     excs_stop = (CancelledError, StopIteration)  # To prevent heap allocation in loop
+    create_task(_await_new_thread_tasks())  # listen for new tasks added from a different thread
     while True:
         # Wait until the head of _task_queue is ready to run
         dt = 1
@@ -203,8 +233,11 @@ def run_until_complete(main_task=None):
             t.data = er
 
 
-# Create a new task from a coroutine and run it until it finishes
+# Create a new task from a coroutine and run it until it finishes.
+# Has to be executed from within the new thread.
 def run(coro):
+    global _thread_ident
+    _thread_ident = _thread.get_ident()
     return run_until_complete(create_task(coro))
 
 
@@ -258,6 +291,19 @@ class Loop:
     def call_exception_handler(context):
         (Loop._exc_handler or Loop.default_exception_handler)(Loop, context)
 
+    def get_thread_ident():
+        return _thread_ident
+
+    def _run_coroutine_threadsafe(coro):
+        if not hasattr(coro, "send"):
+            raise TypeError("coroutine expected")
+        t = Task(coro, globals())
+        with _thread_lock:
+            _task_cache.append(t)
+        _task_cache_event.set()
+        # task might need a while until it gets added to the queue
+        return t
+
 
 # The runq_len and waitq_len arguments are for legacy uasyncio compatibility
 def get_event_loop(runq_len=0, waitq_len=0):
@@ -268,12 +314,19 @@ def current_task():
     return cur_task
 
 
+def current_thread():
+    return _thread_ident
+
+
 def new_event_loop():
     global _task_queue, _io_queue
     # TaskQueue of Task instances
     _task_queue = TaskQueue()
     # Task queue and poller for stream IO
     _io_queue = IOQueue()
+    global _thread_ident
+    _thread_ident = None
+    # reset thread ident so loop can run in a different/new thread.
     return Loop
 
 
